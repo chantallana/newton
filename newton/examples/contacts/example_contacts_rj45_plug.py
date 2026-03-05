@@ -75,13 +75,16 @@ def _apply_gizmo_force(
     body_qd: wp.array(dtype=wp.spatial_vector),
     body_f: wp.array(dtype=wp.spatial_vector),
     body_mass: wp.array(dtype=float),
-    target: wp.vec3,
+    target_arr: wp.array(dtype=wp.vec3),
     stiffness: float,
     damping: float,
-    picked_body: int,
+    picked_body_arr: wp.array(dtype=int),
     plug_idx: int,
     latch_idx: int,
 ):
+    target = target_arr[0]
+    picked_body = picked_body_arr[0]
+
     if picked_body >= 0:
         # During picking, apply only velocity damping to non-picked bodies
         # to prevent undamped oscillation transmitted through the joint.
@@ -291,18 +294,19 @@ class Example:
         self.gizmo_tf = wp.transform(gizmo_pos, wp.quat_identity())
         self._gizmo_target = plug_world_pos
 
+        self._pick_body_arr = wp.array([-1], dtype=int, device=self.model.device)
+        self._gizmo_target_arr = wp.zeros(1, dtype=wp.vec3, device=self.model.device)
+
         self.capture()
 
     def capture(self):
-        # CUDA graph capture is intentionally disabled: the gizmo target and
-        # the picked-body query change every frame, which is incompatible with
-        # a static captured graph.
         self.graph = None
+        if wp.get_device().is_cuda:
+            with wp.ScopedCapture() as capture:
+                self.simulate()
+            self.graph = capture.graph
 
     def simulate(self):
-        picking = getattr(self.viewer, "picking", None)
-        picked_body = int(picking.pick_body.numpy()[0]) if picking is not None else -1
-
         self.model.collide(self.state_0, self.contacts)
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
@@ -314,10 +318,10 @@ class Example:
                     self.state_0.body_qd,
                     self.state_0.body_f,
                     self.model.body_mass,
-                    self._gizmo_target,
+                    self._gizmo_target_arr,
                     self.pick_stiffness,
                     self.pick_damping,
-                    picked_body,
+                    self._pick_body_arr,
                     self._plug_body,
                     self._latch_body,
                 ],
@@ -330,13 +334,23 @@ class Example:
     def step(self):
         gp = wp.transform_get_translation(self.gizmo_tf)
         self._gizmo_target = wp.vec3(float(gp[0]), float(gp[1]) - self._gizmo_offset_y, float(gp[2]))
-        self.simulate()
+
+        picking = getattr(self.viewer, "picking", None)
+        picked_body = int(picking.pick_body.numpy()[0]) if picking is not None else -1
+
+        self._pick_body_arr.assign([picked_body])
+        self._gizmo_target_arr.assign([self._gizmo_target])
+
+        if self.graph:
+            wp.capture_launch(self.graph)
+        else:
+            self.simulate()
+
         self.sim_time += self.frame_dt
 
         # Snap the gizmo to the plug while picking so it stays anchored at
         # the new position once the pick is released.
-        picking = getattr(self.viewer, "picking", None)
-        if picking is not None and int(picking.pick_body.numpy()[0]) >= 0:
+        if picked_body >= 0:
             plug_tf = np.asarray(
                 self.state_0.body_q.numpy()[self._plug_body], dtype=np.float64
             )
