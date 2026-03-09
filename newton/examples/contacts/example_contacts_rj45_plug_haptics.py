@@ -201,8 +201,8 @@ class Example:
         self.sim_dt = self.frame_dt / self.sim_substeps
 
         self.viewer = viewer
-        self.pick_stiffness = 50.0
-        self.pick_damping = 5.0
+        self.pick_stiffness = 2000.0  # Higher stiffness for better control
+        self.pick_damping = 50.0     # Higher damping for stability
 
         usd_path = newton.examples.get_asset("rj45_plug.usd")
         stage = Usd.Stage.Open(usd_path)
@@ -333,8 +333,7 @@ class Example:
         self._pick_body_arr = wp.array([-1], dtype=int, device=self.model.device)
         self._gizmo_target_arr = wp.zeros(1, dtype=wp.vec3, device=self.model.device)
 
-        # Click-impulse state: tracks remaining impulse magnitude.
-        self._click_impulse = 0.0   # current impulse amplitude [N]
+        # Click detection state: tracks latch angle for edge detection
         self._prev_latch_angle = None  # previous-frame latch angle for edge detection
 
         # Haptic feedback: spring reaction force sent to the Haply device.
@@ -514,30 +513,27 @@ class Example:
 
                     # Trigger: latch angle drops below the click threshold —
                     # the latch is snapping inward past the retention ledge.
+                    click_force = np.zeros(3, dtype=np.float64)
                     if (
                         self._prev_latch_angle is not None
                         and self._prev_latch_angle >= CLICK_ANGLE_THRESHOLD
                         and latch_angle < CLICK_ANGLE_THRESHOLD
                     ):
-                        self._click_impulse = CLICK_IMPULSE_MAGNITUDE
+                        # Apply instant click force on the snap event
+                        click_force[1] = CLICK_IMPULSE_MAGNITUDE
                         print(f"[Haply] CLICK! latch {np.degrees(self._prev_latch_angle):.1f}° -> {np.degrees(latch_angle):.1f}°")
 
                     self._prev_latch_angle = latch_angle
 
-                    # Decay the click impulse exponentially.
-                    click_force = np.zeros(3, dtype=np.float64)
-                    if self._click_impulse > 0.01:
-                        # Brief inward tap along insertion axis (+Y = into socket).
-                        click_force[1] = self._click_impulse
-                        self._click_impulse *= np.exp(-self.frame_dt / CLICK_DECAY_TIME)
-                    else:
-                        self._click_impulse = 0.0
-
                     with self._feedback_lock:
-                        self._feedback_force = spring_reaction * HAPLY_FORCE_SCALE + click_force
+                        if click_force[1] > 0:
+                            # During click event, send only the click force
+                            self._feedback_force = click_force
+                        else:
+                            # Normal operation, send zero force (no spring resistance felt)
+                            self._feedback_force = np.zeros(3, dtype=np.float64)
                 else:
                     self._prev_latch_angle = None
-                    self._click_impulse = 0.0
                     with self._feedback_lock:
                         self._feedback_force = np.zeros(3, dtype=np.float64)
 

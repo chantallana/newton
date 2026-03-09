@@ -62,29 +62,64 @@
 ## Current Issue: Duplicate Device Instances
 
 ### 10. Multiple Device Instances Detected
-**Status**: Two Haply inverse3 instances found:
-- One with "Error" status
-- One with "Unknown" status
+**Current Status**: 3 Haply devices found:
+- ✅ 1x `HAPLY_HANDLE_DB0B` (OK status) - **KEEP THIS ONE**
+- ❌ 1x `Haply inverse3` (Error status) - **UNINSTALL**
+- ❌ 1x `Haply inverse3` (Unknown status) - **UNINSTALL**
 
-**Solution Steps**:
+**Goal**: Remove the 2 broken "Haply inverse3" devices, keep the working Bluetooth one.
 
-### Method 1: Device Manager (GUI - Recommended)
-1. **Open Device Manager**:
-   - Press `Windows + R` → type `devmgmt.msc` → Enter
-   - OR Right-click Start button → Device Manager
+### Step-by-Step Uninstall Process:
 
-2. **Find Haply devices**:
-   - Look under these sections:
-     - "Other devices" (devices with error/unknown status)
-     - "Human Interface Devices"
-     - "Universal Serial Bus controllers"
-   - You should see 2x "Haply inverse3" entries
+#### Step 1: Open Device Manager
+1. Press `Windows + R`
+2. Type `devmgmt.msc` 
+3. Press Enter
 
-3. **Uninstall each device**:
-   - Right-click first "Haply inverse3" → "Uninstall device"
-   - ✅ Check "Delete the driver software for this device"
-   - Click "Uninstall"
-   - Repeat for the second "Haply inverse3" entry
+#### Step 2: Locate the Problem Devices
+**You should find:**
+- **1x "Haply inverse3"** under **"Other devices"** ✅ (You found this one!)
+- Possibly **1 more "Haply inverse3"** under:
+  - **"Universal Serial Bus controllers"**
+  - **"Human Interface Devices"**  
+  - **"Unknown devices"**
+- **DO NOT** touch `HAPLY_HANDLE_DB0B` (this one works!)
+
+**If you only see 1 device**: That's progress! Uninstall the one you found, then check other categories.
+
+#### Step 3: Uninstall the Device in "Other devices"
+1. Right-click the **"Haply inverse3"** entry under "Other devices"
+2. Select **"Uninstall device"**
+3. ✅ **IMPORTANT**: Check **"Delete the driver software for this device"**
+4. Click **"Uninstall"**
+
+#### Step 4: Look for Additional Devices
+1. **Expand these sections** in Device Manager:
+   - "Universal Serial Bus controllers"
+   - "Human Interface Devices"
+   - Any section with warning icons
+2. Look for another **"Haply inverse3"** entry
+3. If found, repeat the uninstall process from Step 3
+
+#### Step 5: Verify Cleanup
+1. Press **F5** to refresh Device Manager
+2. The 2 "Haply inverse3" entries should be **gone**
+3. `HAPLY_HANDLE_DB0B` should still be there with **OK status**
+
+#### Step 6: Reconnect Device
+1. **Unplug USB cable** from computer
+2. **Power off** Haply device (unplug power adapter)  
+3. **Wait 30 seconds**
+4. **Plug power back in** (wait for LED to turn on)
+5. **Plug USB cable back in**
+6. Windows should automatically install fresh drivers
+
+#### Step 7: Test Connection
+Run this command to verify only 1 working device remains:
+```powershell
+Get-PnpDevice | Where-Object {$_.FriendlyName -like "*Haply*"}
+```
+You should see only devices with "OK" status.
 
 ### Method 2: PowerShell (Advanced)
 ```powershell
