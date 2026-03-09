@@ -63,7 +63,10 @@ async def main():
                         "device_id": inverse3_device_id,
                         "commands": {
                             "set_cursor_force": {
-                                "values": force
+                                "vector": force
+                            },
+                            "set_uniform_damping": {
+                                "damping": 2.0
                             }
                         }
                     }

@@ -201,8 +201,8 @@ class Example:
         self.sim_dt = self.frame_dt / self.sim_substeps
 
         self.viewer = viewer
-        self.pick_stiffness = 2000.0  # Higher stiffness for better control
-        self.pick_damping = 50.0     # Higher damping for stability
+        self.pick_stiffness = 50.0   # Original stiffness value
+        self.pick_damping = 5.0      # Original damping value
 
         usd_path = newton.examples.get_asset("rj45_plug.usd")
         stage = Usd.Stage.Open(usd_path)
@@ -530,8 +530,8 @@ class Example:
                             # During click event, send only the click force
                             self._feedback_force = click_force
                         else:
-                            # Normal operation, send zero force (no spring resistance felt)
-                            self._feedback_force = np.zeros(3, dtype=np.float64)
+                            # Normal operation: send spring reaction force scaled for haptic device
+                            self._feedback_force = spring_reaction * HAPLY_FORCE_SCALE
                 else:
                     self._prev_latch_angle = None
                     with self._feedback_lock:
