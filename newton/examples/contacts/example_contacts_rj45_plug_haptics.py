@@ -24,11 +24,11 @@
 # Commands:
 #     uv sync --extra examples
 #     uv run -m newton.examples contacts_rj45_plug
-#
 ###########################################################################
 
 import asyncio
 import threading
+import time
 
 import numpy as np
 import warp as wp
@@ -77,25 +77,57 @@ LATCH_SPRING_KD = 0.01    # angular return-spring damping [N*m*s/rad]
 # Viewer pick stiffness override (default 50 is too weak to disconnect).
 # Damping is left at the default (5) to stay within the explicit-integration
 # stability limit for the light latch body.
-PICK_STIFFNESS = 2000.0
+VIEWER_PICK_STIFFNESS = 1000.0
 
 # Haply Inverse3 haptic-device settings.
 HAPLY_URI = "ws://localhost:10001"  # WebSocket endpoint for Inverse Service 3.1
-HAPLY_FORCE_SCALE = 0.8             # tune to map simulation Newtons to device Newtons
+HAPLY_FORCE_SCALE = 0.2             # tune to map simulation Newtons to device Newtons
 HAPLY_POSITION_SCALE = 1.0          # tune to map device metres to simulation metres
-HAPLY_FORCE_DAMPING = 0.5           # velocity damping added to haptic feedback [N*s/m]
+HAPLY_FORCE_DAMPING = 0.0           # velocity damping added to haptic feedback [N*s/m]
+HAPLY_FORCE_SMOOTHING = 0.05        # EMA time constant [s] for low-pass filtering haptic force
+HAPLY_MAX_FORCE = 3.0               # max force magnitude [N] sent to device (clamp)
+HAPLY_SLEW_RATE = 40.0              # max force change rate [N/s] per axis
 
 # Click-impulse feedback: a short force pulse when the latch snaps past the
 # retention ledge.  The impulse is triggered when the latch angle jumps from
 # below to above the rest position (latch springing outward after clearing
 # the retention ledge) and decays exponentially.
 CLICK_IMPULSE_MAGNITUDE = 1.0       # peak force [N] of the click pulse (along insertion axis)
-CLICK_DECAY_TIME = 0.03             # exponential decay time constant [s]
+CLICK_DECAY_TIME = 0.15             # time [s] to fade spring force back in after click
 CLICK_ANGLE_THRESHOLD = 0.052       # latch angle [rad] crossing triggers click (~3°)
+CLICK_COOLDOWN = 0.8                # minimum time [s] between consecutive click pulses
 
 # Button B: override latch joint target to push it inward.
 LATCH_PUSH_ANGLE = -0.2             # target angle [rad] when button B held (= limit_lower)
-LATCH_PUSH_FORCE = 0.5              # upward haptic force [N] while pushing latch (button B)
+LATCH_PUSH_FORCE = 0.15             # upward haptic force [N] while pushing latch (button B)
+
+
+@wp.kernel
+def _compute_haptic_force_kernel(
+    body_q: wp.array(dtype=wp.transform),
+    body_qd: wp.array(dtype=wp.spatial_vector),
+    target_arr: wp.array(dtype=wp.vec3),
+    stiffness: float,
+    damping: float,
+    force_scale: float,
+    plug_idx: int,
+    out_force: wp.array(dtype=wp.vec3),
+    out_plug_pos: wp.array(dtype=wp.vec3),
+    out_plug_vel: wp.array(dtype=wp.vec3),
+    out_plug_quat: wp.array(dtype=wp.quat),
+    out_latch_quat: wp.array(dtype=wp.quat),
+    latch_idx: int,
+):
+    """GPU kernel: compute spring reaction force and copy relevant state for haptic feedback."""
+    target = target_arr[0]
+    pos = wp.transform_get_translation(body_q[plug_idx])
+    vel = wp.spatial_top(body_qd[plug_idx])
+    reaction = stiffness * (pos - target) - damping * vel
+    out_force[0] = reaction * force_scale
+    out_plug_pos[0] = pos
+    out_plug_vel[0] = vel
+    out_plug_quat[0] = wp.transform_get_rotation(body_q[plug_idx])
+    out_latch_quat[0] = wp.transform_get_rotation(body_q[latch_idx])
 
 
 @wp.kernel
@@ -201,8 +233,8 @@ class Example:
         self.sim_dt = self.frame_dt / self.sim_substeps
 
         self.viewer = viewer
-        self.pick_stiffness = 50.0   # Original stiffness value
-        self.pick_damping = 5.0      # Original damping value
+        self.gizmo_stiffness = 1000.0   # Spring stiffness for gizmo/haptic coupling
+        self.gizmo_damping = 10.0       # Damping to match stiffness
 
         usd_path = newton.examples.get_asset("rj45_plug.usd")
         stage = Usd.Stage.Open(usd_path)
@@ -300,9 +332,9 @@ class Example:
         self.viewer.set_model(self.model)
         self.viewer.picking_enabled = True
         if hasattr(self.viewer, "picking"):
-            self.viewer.picking.pick_stiffness = PICK_STIFFNESS
+            self.viewer.picking.pick_stiffness = VIEWER_PICK_STIFFNESS
             pick_state_np = self.viewer.picking.pick_state.numpy()
-            pick_state_np[0]["pick_stiffness"] = PICK_STIFFNESS
+            pick_state_np[0]["pick_stiffness"] = VIEWER_PICK_STIFFNESS
             self.viewer.picking.pick_state.assign(pick_state_np)
 
         mid_y = (float(sc[1]) + float(plug_pos[1])) / 2.0
@@ -325,6 +357,24 @@ class Example:
 
         self.solver = SolverXPBD(self.model, iterations=16, rigid_contact_relaxation=0.8, angular_damping=0.5)
 
+        # ------------------------------------------------------------------
+        # Pinned CPU buffers for substep-rate haptic feedback.
+        # These GPU→host copies are recorded *inside* the CUDA graph so the
+        # haptic thread always sees the most recent substep's data without
+        # any Python-side synchronisation or graph-breaking readbacks.
+        # ------------------------------------------------------------------
+        dev = self.model.device
+        self._haptic_force_device = wp.zeros(1, dtype=wp.vec3, device=dev)
+        self._haptic_force_host = wp.zeros(1, dtype=wp.vec3, pinned=True)
+        self._haptic_plug_pos_device = wp.zeros(1, dtype=wp.vec3, device=dev)
+        self._haptic_plug_pos_host = wp.zeros(1, dtype=wp.vec3, pinned=True)
+        self._haptic_plug_vel_device = wp.zeros(1, dtype=wp.vec3, device=dev)
+        self._haptic_plug_vel_host = wp.zeros(1, dtype=wp.vec3, pinned=True)
+        self._haptic_plug_quat_device = wp.zeros(1, dtype=wp.quat, device=dev)
+        self._haptic_plug_quat_host = wp.zeros(1, dtype=wp.quat, pinned=True)
+        self._haptic_latch_quat_device = wp.zeros(1, dtype=wp.quat, device=dev)
+        self._haptic_latch_quat_host = wp.zeros(1, dtype=wp.quat, pinned=True)
+
         self._gizmo_offset_y = float(plug_half_ext[1])
         gizmo_pos = wp.vec3(plug_world_pos[0], plug_world_pos[1] + self._gizmo_offset_y, plug_world_pos[2])
         self.gizmo_tf = wp.transform(gizmo_pos, wp.quat_identity())
@@ -335,9 +385,18 @@ class Example:
 
         # Click detection state: tracks latch angle for edge detection
         self._prev_latch_angle = None  # previous-frame latch angle for edge detection
+        # When a click is detected, suppress spring force until this timestamp
+        # to avoid oscillations from the stale GPU-computed spring force.
+        self._click_suppress_until = 0.0
+        # Cooldown: earliest time a new click is allowed (prevents double-clicks).
+        self._click_cooldown_until = 0.0
 
         # Haptic feedback: spring reaction force sent to the Haply device.
         self._feedback_force = np.zeros(3, dtype=np.float64)
+        # Click force overlay (set by step() at 60 Hz, read by haptic thread).
+        self._click_force = np.zeros(3, dtype=np.float64)
+        # Whether button B latch push is active (read by haptic thread).
+        self._latch_push_active = False
         # Haptic input: cursor position received from the Haply device.
         # None means no position has been received yet (device not connected).
         self._haply_position = None  # type: np.ndarray | None
@@ -381,8 +440,8 @@ class Example:
                     self.state_0.body_f,
                     self.model.body_mass,
                     self._gizmo_target_arr,
-                    self.pick_stiffness,
-                    self.pick_damping,
+                    self.gizmo_stiffness,
+                    self.gizmo_damping,
                     self._pick_body_arr,
                     self._plug_body,
                     self._latch_body,
@@ -392,6 +451,33 @@ class Example:
             self.viewer.apply_forces(self.state_0)
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
+
+            # -- Substep haptic force: compute on GPU, async copy to pinned host --
+            wp.launch(
+                kernel=_compute_haptic_force_kernel,
+                dim=1,
+                inputs=[
+                    self.state_0.body_q,
+                    self.state_0.body_qd,
+                    self._gizmo_target_arr,
+                    self.gizmo_stiffness,
+                    HAPLY_FORCE_DAMPING,
+                    HAPLY_FORCE_SCALE,
+                    self._plug_body,
+                    self._haptic_force_device,
+                    self._haptic_plug_pos_device,
+                    self._haptic_plug_vel_device,
+                    self._haptic_plug_quat_device,
+                    self._haptic_latch_quat_device,
+                    self._latch_body,
+                ],
+                device=self.model.device,
+            )
+            wp.copy(self._haptic_force_host, self._haptic_force_device)
+            wp.copy(self._haptic_plug_pos_host, self._haptic_plug_pos_device)
+            wp.copy(self._haptic_plug_vel_host, self._haptic_plug_vel_device)
+            wp.copy(self._haptic_plug_quat_host, self._haptic_plug_quat_device)
+            wp.copy(self._haptic_latch_quat_host, self._haptic_latch_quat_device)
 
     def step(self):
         # If the Haply device has sent a position and the clutch is held, drive the gizmo.
@@ -454,7 +540,6 @@ class Example:
                     [float(plug_q[0]), float(plug_q[1]), float(plug_q[2])], dtype=np.float64
                 )
                 self._prev_latch_angle = None
-                print("[Haply] Reset to initial positions.")
 
         if self.graph:
             wp.capture_launch(self.graph)
@@ -482,67 +567,57 @@ class Example:
                 with self._feedback_lock:
                     clutch = self._clutch_active
                 if clutch:
-                    # Compute the spring reaction force (what the user "feels").
-                    # reaction = stiffness * (plug_pos - target) - damping * velocity
-                    body_qd_np = self.state_0.body_qd.numpy()
-                    plug_pos = np.array(body_q_np[self._plug_body][:3], dtype=np.float64)
-                    plug_vel = np.array(body_qd_np[self._plug_body][:3], dtype=np.float64)
-                    target = np.array(
-                        [self._gizmo_target[0], self._gizmo_target[1], self._gizmo_target[2]],
-                        dtype=np.float64,
-                    )
-                    spring_reaction = (
-                        self.pick_stiffness * (plug_pos - target) - HAPLY_FORCE_DAMPING * plug_vel
-                    )
+                    # The pinned host buffers already contain the latest
+                    # substep's spring reaction force computed on the GPU
+                    # (updated ~960 Hz inside the CUDA graph).  The haptic
+                    # thread reads those directly.  Here we only do the
+                    # click edge-detection which runs at 60 Hz.
+                    plug_quat_np = self._haptic_plug_quat_host.numpy()[0]
+                    latch_quat_np = self._haptic_latch_quat_host.numpy()[0]
 
-                    # --- Click impulse from latch snap ---
-                    # XPBD works in maximal coordinates so joint_q is NOT
-                    # updated after solving.  Compute the latch hinge angle
-                    # from the relative orientation of the two bodies instead.
-                    plug_quat = body_q_np[self._plug_body][3:7]   # (x, y, z, w)
-                    latch_quat = body_q_np[self._latch_body][3:7]
                     # Relative quaternion: q_rel = conj(plug) * latch
-                    pw, px, py, pz = float(plug_quat[3]), float(plug_quat[0]), float(plug_quat[1]), float(plug_quat[2])
-                    lw, lx, ly, lz = float(latch_quat[3]), float(latch_quat[0]), float(latch_quat[1]), float(latch_quat[2])
-                    # conj(plug) = (pw, -px, -py, -pz)
+                    pw, px, py, pz = float(plug_quat_np[3]), float(plug_quat_np[0]), float(plug_quat_np[1]), float(plug_quat_np[2])
+                    lw, lx, ly, lz = float(latch_quat_np[3]), float(latch_quat_np[0]), float(latch_quat_np[1]), float(latch_quat_np[2])
                     rw = pw * lw + px * lx + py * ly + pz * lz
                     rx = pw * lx - px * lw - py * lz + pz * ly
-                    # Hinge axis is -X, so the angle around X is:
-                    latch_angle = 2.0 * np.arctan2(-rx, rw)  # negate for -X axis
-                    print(f"[Latch] {np.degrees(latch_angle):.1f}°")
+                    latch_angle = 2.0 * np.arctan2(-rx, rw)
 
-                    # Trigger: latch angle drops below the click threshold —
-                    # the latch is snapping inward past the retention ledge.
                     click_force = np.zeros(3, dtype=np.float64)
-                    if (
+                    now = time.perf_counter()
+                    crossing = (
                         self._prev_latch_angle is not None
                         and self._prev_latch_angle >= CLICK_ANGLE_THRESHOLD
                         and latch_angle < CLICK_ANGLE_THRESHOLD
+                    )
+                    if (
+                        crossing
+                        and now >= self._click_cooldown_until
                     ):
-                        # Apply instant click force on the snap event
-                        click_force[1] = CLICK_IMPULSE_MAGNITUDE
-                        print(f"[Haply] CLICK! latch {np.degrees(self._prev_latch_angle):.1f}° -> {np.degrees(latch_angle):.1f}°")
+                        click_force[2] = -CLICK_IMPULSE_MAGNITUDE
+                        # Suppress spring force for a short window so the
+                        # stale GPU-computed spring doesn't fight the click.
+                        self._click_suppress_until = now + CLICK_DECAY_TIME
+                        # Prevent another click from firing for CLICK_COOLDOWN seconds.
+                        self._click_cooldown_until = now + CLICK_COOLDOWN
 
                     self._prev_latch_angle = latch_angle
 
+                    # Store click force for the haptic thread to blend in.
                     with self._feedback_lock:
-                        if click_force[1] > 0:
-                            # During click event, send only the click force
-                            self._feedback_force = click_force
-                        else:
-                            # Normal operation: send spring reaction force scaled for haptic device
-                            self._feedback_force = spring_reaction * HAPLY_FORCE_SCALE
+                        self._click_force = click_force
                 else:
                     self._prev_latch_angle = None
                     with self._feedback_lock:
-                        self._feedback_force = np.zeros(3, dtype=np.float64)
+                        self._click_force = np.zeros(3, dtype=np.float64)
 
                 # Button B: add an upward force even when not clutching so
                 # the user always feels the latch push.
                 if push_latch:
                     with self._feedback_lock:
-                        self._feedback_force = self._feedback_force.copy()
-                        self._feedback_force[2] += LATCH_PUSH_FORCE
+                        self._latch_push_active = True
+                else:
+                    with self._feedback_lock:
+                        self._latch_push_active = False
 
     def render(self):
         self.viewer.begin_frame(self.sim_time)
@@ -566,10 +641,18 @@ class Example:
 
     async def _haply_async_loop(self):
         """Async loop: receive device state, send back the simulation spring force."""
+        import time
+
         first_message = True
         inverse3_device_id = None
         prev_clutch = False
         buttons_printed = False
+        _haptic_msg_count = 0
+        _haptic_rate_t0 = time.perf_counter()
+        _prev_time = time.perf_counter()
+        # Exponential moving average state for smoothing the spring force.
+        _smooth_fx, _smooth_fy, _smooth_fz = 0.0, 0.0, 0.0
+        _prev_fx, _prev_fy, _prev_fz = 0.0, 0.0, 0.0
 
         async with websockets.connect(HAPLY_URI) as ws:
             while True:
@@ -594,13 +677,15 @@ class Example:
                 # Read Verse Grip buttons.
                 buttons = verse_grip_data.get("state", {}).get("buttons", {})
                 if buttons and not buttons_printed:
-                    print(f"[Haply] Raw buttons dict: {buttons}")
                     buttons_printed = True
                 clutch = bool(
                     buttons.get("1", False)
                     or buttons.get("b1", False)
                     or buttons.get("a", False)
                     or buttons.get("primary", False)
+                    or buttons.get("2", False)
+                    or buttons.get("b2", False)
+                    or buttons.get("b", False)
                 )
                 button_b = bool(
                     buttons.get("2", False)
@@ -612,11 +697,6 @@ class Example:
                     or buttons.get("b3", False)
                     or buttons.get("c", False)
                 )
-                if button_b:
-                    print("[Haply] Button B held")
-                if button_c:
-                    print("[Haply] Button C pressed")
-
                 # Extract cursor position from device state and store it.
                 cursor_pos = inverse3_data.get("state", {}).get("cursor_position", {})
                 if cursor_pos:
@@ -651,9 +731,71 @@ class Example:
 
                 prev_clutch = clutch
 
-                # Read the latest feedback force (thread-safe).
+                # Read the latest force from the pinned CPU buffer (updated at
+                # ~960 Hz inside the CUDA graph) and blend in click / latch
+                # push overlays set by step() at 60 Hz.
+                force_vec = self._haptic_force_host.numpy()[0]  # pinned: no sync needed
+                raw_fx, raw_fy, raw_fz = float(force_vec[0]), float(force_vec[1]), float(force_vec[2])
+
                 with self._feedback_lock:
-                    fx, fy, fz = self._feedback_force
+                    clutch = self._clutch_active
+                    click = self._click_force.copy()
+                    latch_push = self._latch_push_active
+                    suppress_until = self._click_suppress_until
+
+                if not clutch:
+                    raw_fx, raw_fy, raw_fz = 0.0, 0.0, 0.0
+
+                # After a click event, smoothly fade the spring force back in
+                # over CLICK_DECAY_TIME seconds so there's no abrupt snap-back
+                # that feels like a second click.
+                remaining = suppress_until - time.perf_counter()
+                if remaining > 0:
+                    blend = 1.0 - (remaining / CLICK_DECAY_TIME)
+                    blend = max(0.0, min(1.0, blend))
+                    raw_fx *= blend
+                    raw_fy *= blend
+                    raw_fz *= blend
+
+                # Low-pass filter (EMA) to remove high-frequency oscillation
+                # from the 60 Hz stale GPU force being sent at ~2500 Hz.
+                now_t = time.perf_counter()
+                dt = now_t - _prev_time
+                _prev_time = now_t
+                if dt > 0 and HAPLY_FORCE_SMOOTHING > 0:
+                    alpha = min(1.0, dt / HAPLY_FORCE_SMOOTHING)
+                else:
+                    alpha = 1.0
+                _smooth_fx += alpha * (raw_fx - _smooth_fx)
+                _smooth_fy += alpha * (raw_fy - _smooth_fy)
+                _smooth_fz += alpha * (raw_fz - _smooth_fz)
+
+                # Slew rate limiter: cap how fast force can change per tick
+                # to prevent contact-bounce spikes from reaching the device.
+                if dt > 0:
+                    max_delta = HAPLY_SLEW_RATE * dt
+                    _smooth_fx = _prev_fx + max(-max_delta, min(max_delta, _smooth_fx - _prev_fx))
+                    _smooth_fy = _prev_fy + max(-max_delta, min(max_delta, _smooth_fy - _prev_fy))
+                    _smooth_fz = _prev_fz + max(-max_delta, min(max_delta, _smooth_fz - _prev_fz))
+                _prev_fx, _prev_fy, _prev_fz = _smooth_fx, _smooth_fy, _smooth_fz
+
+                fx, fy, fz = _smooth_fx, _smooth_fy, _smooth_fz
+
+                # Clamp force magnitude to prevent large spikes.
+                mag = (fx * fx + fy * fy + fz * fz) ** 0.5
+                if mag > HAPLY_MAX_FORCE:
+                    s = HAPLY_MAX_FORCE / mag
+                    fx *= s
+                    fy *= s
+                    fz *= s
+
+                # Overlay click impulse (replaces spring force for one frame).
+                if click[2] != 0:
+                    fx, fy, fz = float(click[0]), float(click[1]), float(click[2])
+
+                # Overlay latch push force (downward).
+                if latch_push:
+                    fz -= LATCH_PUSH_FORCE
 
                 request_msg = {
                     "inverse3": [
@@ -672,6 +814,16 @@ class Example:
                     ]
                 }
                 await ws.send(orjson.dumps(request_msg))
+
+                # Print haptic send rate every 2 seconds.
+                _haptic_msg_count += 1
+                now = time.perf_counter()
+                elapsed = now - _haptic_rate_t0
+                if elapsed >= 2.0:
+                    rate = _haptic_msg_count / elapsed
+                    print(f"[Haply] send rate: {rate:.0f} Hz")
+                    _haptic_msg_count = 0
+                    _haptic_rate_t0 = now
 
     def test_final(self):
         body_q = self.state_0.body_q.numpy()

@@ -64,9 +64,6 @@ async def main():
                         "commands": {
                             "set_cursor_force": {
                                 "vector": force
-                            },
-                            "set_uniform_damping": {
-                                "damping": 2.0
                             }
                         }
                     }
